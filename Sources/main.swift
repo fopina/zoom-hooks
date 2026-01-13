@@ -1,115 +1,134 @@
 //  main.swift
 //  ZoomHooks
 
-import Cocoa
-import ApplicationServices
-
+@preconcurrency import Cocoa
+@preconcurrency import ApplicationServices
 import Darwin
 
 @MainActor
-func ensureAccessibilityPermissions() {
-    let handle = dlopen(nil, RTLD_NOW)
-    let sym = dlsym(handle, "kAXTrustedCheckOptionPrompt")
-    let ptr = sym!.assumingMemoryBound(to: CFString?.self)
-    let prompt = ptr.pointee!
-    let options: NSDictionary = [prompt: true]
-    let trusted = AXIsProcessTrustedWithOptions(options)
-    if !trusted {
-        print("Accessibility permissions are required. Please grant access in System Preferences > Security & Privacy > Privacy > Accessibility, then re-launch the app.")
-        exit(1)
-    }
+@discardableResult
+func ensureAccessibilityPermissions(prompt: Bool = true) -> Bool {
+    // Use the public constant directly; no dlopen/dlsym or force unwraps.
+    let options = [("kAXTrustedCheckOptionPrompt" as CFString): prompt] as CFDictionary
+    return AXIsProcessTrustedWithOptions(options)
 }
 
 @MainActor
-func main() {
-    ensureAccessibilityPermissions()
-    print("Accessibility permissions granted. (AX monitoring will begin here.)")
+final class ZoomAXMonitor {
+    private let pid: pid_t
+    private var observer: AXObserver?
+    private let appElement: AXUIElement
+    private var openWindows = Set<UnsafeRawPointer>()
 
-    // 1. Find zoom.us process
-    guard let zoomApp = NSRunningApplication.runningApplications(withBundleIdentifier: "us.zoom.xos").first,
-          zoomApp.isTerminated == false else {
-        print("Could not find running zoom.us process.")
-        exit(1)
+    init(pid: pid_t) {
+        self.pid = pid
+        self.appElement = AXUIElementCreateApplication(pid)
     }
-    print("Found zoom.us PID: \(zoomApp.processIdentifier)")
 
-    // 2. Create AXUIElement for zoom.us
-    let zoomAXApp = AXUIElementCreateApplication(zoomApp.processIdentifier)
+    func start() throws {
+        var obs: AXObserver?
+        let err = AXObserverCreate(pid, { _, element, notification, refcon in
+            guard let refcon = refcon else { return }
+            let monitor = Unmanaged<ZoomAXMonitor>.fromOpaque(refcon).takeUnretainedValue()
+            monitor.handle(element: element, notification: notification as String)
+        }, &obs)
+        guard err == .success, let axObs = obs else {
+            throw MonitorError.createObserverFailed
+        }
+        observer = axObs
 
-    // 3. Set up AXObserver for window events
-    var observer: AXObserver?
+        // Subscribe to window create/destroy
+        for notif in [kAXWindowCreatedNotification, kAXUIElementDestroyedNotification] as [CFString] {
+            let e = AXObserverAddNotification(axObs, appElement, notif, Unmanaged.passUnretained(self).toOpaque())
+            if e != .success {
+                fputs("Error subscribing to \(notif): \(e.rawValue)\n", stderr)
+            }
+        }
 
-    // TRACKING: Store open Zoom Meeting windows by AXUIElementRef hash
-    final class WindowTracker {
-        var openZoomWindows = Set<Int>()
+        // Add observer to run loop
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(axObs), .defaultMode)
     }
-    let tracker = WindowTracker()
-    let trackerPtr = Unmanaged.passUnretained(tracker).toOpaque()
 
-    let callback: AXObserverCallback = { observer, element, notification, refcon in
-        guard let refcon = refcon else { return }
-        let tracker = Unmanaged<WindowTracker>.fromOpaque(refcon).takeUnretainedValue()
+    deinit {
+        if let obs = observer {
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(obs), .defaultMode)
+        }
+    }
 
-        // Query AX role
-        var value: AnyObject?
-        _ = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &value)
-        let role = value as? String ?? "(nil)"
+    private func handle(element: AXUIElement, notification: String) {
+        let key = Unmanaged.passUnretained(element).toOpaque()
+        let role = attribute(element, kAXRoleAttribute as CFString) as? String ?? ""
+        let title = attribute(element, kAXTitleAttribute as CFString) as? String ?? ""
 
-        // Query AX title
-        var title: AnyObject?
-        _ = AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &title)
-        let windowTitle = title as? String ?? "(no title)"
-
-        let notif = notification as String
-
-        // Simple hash for AXUIElementRef identity
-        let elementPtr = Unmanaged.passUnretained(element).toOpaque()
-        let elementHash = elementPtr.hashValue
-
-        if notif == kAXWindowCreatedNotification as String {
-            if role == kAXWindowRole as String && windowTitle == "Zoom Meeting" {
-                tracker.openZoomWindows.insert(elementHash)
+        if notification == (kAXWindowCreatedNotification as String) {
+            if role == (kAXWindowRole as String) && title == "Zoom Meeting" {
+                openWindows.insert(key)
                 print("Zoom Meeting window CREATED.")
-            } else {
-                print("Window created with title: \(windowTitle) (role: \(role))")
             }
-        } else if notif == kAXUIElementDestroyedNotification as String {
-            if tracker.openZoomWindows.contains(elementHash) {
-                tracker.openZoomWindows.remove(elementHash)
+        } else if notification == (kAXUIElementDestroyedNotification as String) {
+            if openWindows.remove(key) != nil {
                 print("Zoom Meeting window DESTROYED.")
-            } else {
-                print("Window destroyed (role: \(role), title: \(windowTitle))")
             }
-        } else {
-            print("AX Notification: \(notification) for: \(windowTitle) (role: \(role))")
         }
     }
 
-    let pid = zoomApp.processIdentifier
-    let result = AXObserverCreate(pid, callback, &observer)
-    guard result == .success, let axObserver = observer else {
-        print("Failed to create AXObserver for zoom.us")
-        exit(1)
+    private func attribute(_ element: AXUIElement, _ attr: CFString) -> AnyObject? {
+        var value: AnyObject?
+        _ = AXUIElementCopyAttributeValue(element, attr, &value)
+        return value
     }
 
-    // 4. Subscribe to window creation & destruction
-    let notifications = [kAXWindowCreatedNotification, kAXUIElementDestroyedNotification]
-    for notif in notifications {
-        let error = AXObserverAddNotification(axObserver, zoomAXApp, notif as CFString, trackerPtr)
-        if error != .success {
-            print("Error subscribing to \(notif): \(error.rawValue)")
-        }
-    }
-
-    // 5. Add observer to run loop
-    CFRunLoopAddSource(CFRunLoopGetCurrent(),
-                       AXObserverGetRunLoopSource(axObserver),
-                       CFRunLoopMode.defaultMode)
-    print("AXObserver for zoom.us established.")
-
-    // Keep the runloop going indefinitely
-    CFRunLoopRun()
+    enum MonitorError: Error { case createObserverFailed }
 }
 
-// Entry point for CLI
-main()
+@MainActor
+@main
+struct ZoomHooksMain {
+    static func main() {
+        guard ensureAccessibilityPermissions(prompt: true) else {
+            fputs("Accessibility permissions are required. Grant access in System Settings > Privacy & Security > Accessibility and re-launch.\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+
+        if let zoom = NSRunningApplication.runningApplications(withBundleIdentifier: "us.zoom.xos").first,
+           !zoom.isTerminated {
+            runMonitor(for: zoom.processIdentifier)
+        } else {
+            waitForZoomAndRun()
+        }
+    }
+
+    private static func runMonitor(for pid: pid_t) {
+        do {
+            let monitor = ZoomAXMonitor(pid: pid)
+            try monitor.start()
+            print("AXObserver for zoom.us established (PID \(pid)).")
+            trapSIGINTForCleanExit()
+            CFRunLoopRun()
+        } catch {
+            fputs("Failed to create AXObserver: \(error)\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+    }
+
+    private static func waitForZoomAndRun() {
+        let center = NSWorkspace.shared.notificationCenter
+        let token = center.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { note in
+            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  app.bundleIdentifier == "us.zoom.xos" else { return }
+            Task { @MainActor in
+                runMonitor(for: app.processIdentifier)
+            }
+        }
+        print("Waiting for Zoom (us.zoom.xos) to launch…")
+        trapSIGINTForCleanExit()
+        CFRunLoopRun()
+        center.removeObserver(token)
+    }
+
+    private static func trapSIGINTForCleanExit() {
+        signal(SIGINT) { _ in
+            CFRunLoopStop(CFRunLoopGetCurrent())
+        }
+    }
+}
