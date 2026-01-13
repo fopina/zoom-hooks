@@ -38,35 +38,53 @@ func main() {
 
     // 3. Set up AXObserver for window events
     var observer: AXObserver?
+
+    // TRACKING: Store open Zoom Meeting windows by AXUIElementRef hash
+    final class WindowTracker {
+        var openZoomWindows = Set<Int>()
+    }
+    let tracker = WindowTracker()
+    let trackerPtr = Unmanaged.passUnretained(tracker).toOpaque()
+
     let callback: AXObserverCallback = { observer, element, notification, refcon in
+        guard let refcon = refcon else { return }
+        let tracker = Unmanaged<WindowTracker>.fromOpaque(refcon).takeUnretainedValue()
+
         // Query AX role
         var value: AnyObject?
         _ = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &value)
         let role = value as? String ?? "(nil)"
-        
+
         // Query AX title
         var title: AnyObject?
         _ = AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &title)
         let windowTitle = title as? String ?? "(no title)"
-        
+
         let notif = notification as String
-        
+
+        // Simple hash for AXUIElementRef identity
+        let elementPtr = Unmanaged.passUnretained(element).toOpaque()
+        let elementHash = elementPtr.hashValue
+
         if notif == kAXWindowCreatedNotification as String {
             if role == kAXWindowRole as String && windowTitle == "Zoom Meeting" {
+                tracker.openZoomWindows.insert(elementHash)
                 print("Zoom Meeting window CREATED.")
             } else {
                 print("Window created with title: \(windowTitle) (role: \(role))")
             }
         } else if notif == kAXUIElementDestroyedNotification as String {
-            if role == kAXWindowRole as String && windowTitle == "Zoom Meeting" {
+            if tracker.openZoomWindows.contains(elementHash) {
+                tracker.openZoomWindows.remove(elementHash)
                 print("Zoom Meeting window DESTROYED.")
             } else {
-                print("Window destroyed with title: \(windowTitle) (role: \(role))")
+                print("Window destroyed (role: \(role), title: \(windowTitle))")
             }
         } else {
             print("AX Notification: \(notification) for: \(windowTitle) (role: \(role))")
         }
     }
+
     let pid = zoomApp.processIdentifier
     let result = AXObserverCreate(pid, callback, &observer)
     guard result == .success, let axObserver = observer else {
@@ -77,7 +95,7 @@ func main() {
     // 4. Subscribe to window creation & destruction
     let notifications = [kAXWindowCreatedNotification, kAXUIElementDestroyedNotification]
     for notif in notifications {
-        let error = AXObserverAddNotification(axObserver, zoomAXApp, notif as CFString, nil)
+        let error = AXObserverAddNotification(axObserver, zoomAXApp, notif as CFString, trackerPtr)
         if error != .success {
             print("Error subscribing to \(notif): \(error.rawValue)")
         }
