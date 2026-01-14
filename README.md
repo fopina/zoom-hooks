@@ -1,7 +1,8 @@
 # zoom-hooks
 
-> Status:  
-> Work in progress — just a detection test for now, needs configurable commands to run on window creation and destruction
+> DEPRECATED  
+> Dropped this custom monitor by an [Hammerspoon](https://www.hammerspoon.org/) [custom script](https://gist.github.com/fopina/af078ef1c03b48c2bcc294da9e282f6a)  
+> This was a work in progress anyway — just a detection test, missing configurable commands to run on window creation and destruction
 
 A tiny macOS Swift command-line tool that listens to Zoom window events via the macOS Accessibility (AX) API and logs when a “Zoom Meeting” window is created or destroyed. Useful as a building block to trigger local automations whenever you join/leave a Zoom meeting.
 
